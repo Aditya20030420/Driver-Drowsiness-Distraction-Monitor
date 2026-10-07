@@ -1,0 +1,7 @@
+streamlit>=1.50
+streamlit-webrtc>=0.60
+plotly
+mediapipe==0.10.21
+numpy
+# optional, only if you ship a trained driver_monitor.pt:
+# torch

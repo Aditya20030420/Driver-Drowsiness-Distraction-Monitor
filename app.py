@@ -1,14 +1,17 @@
-"""Glassmorphism Streamlit dashboard. Run:  streamlit run app.py
+"""Glassmorphism Streamlit dashboard (browser webcam via WebRTC, so it can be deployed). Run:  streamlit run app.py
 
 Three fluid columns (no sidebar): live stream | telemetry KPIs | timeline analytics.
 Streamlit only *renders*; capture, mesh and inference live in pipeline.py threads.
 """
 import logging
+import os
 import time
 
 import numpy as np
 import plotly.graph_objects as go
+import av
 import streamlit as st
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from pipeline import EAR_CLOSED, MAR_YAWN, Pipeline
 
@@ -54,17 +57,17 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 theme_slot = st.empty()  # re-rendered only when the safety state changes
 
 
-@st.cache_resource
-def _registry():
-    return {}
-
-
-def get_pipeline(idx):
-    """One live pipeline at a time; survives Streamlit reruns."""
-    reg = _registry()
-    for k in [k for k in reg if k != idx or reg[k].dead]:
-        reg.pop(k).stop()
-    return reg.setdefault(idx, Pipeline(idx))
+def rtc_config():
+    """Google STUN by default; add a TURN relay via env/secrets (TURN_URL, TURN_USER, TURN_PASS) when the host blocks
+    UDP (Hugging Face Spaces, Render)."""
+    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    try:
+        get = lambda k: os.environ.get(k) or st.secrets.get(k, "")
+        if get("TURN_URL"):
+            servers.append({"urls": [get("TURN_URL")], "username": get("TURN_USER"), "credential": get("TURN_PASS")})
+    except Exception:  # no secrets file when running locally
+        pass
+    return {"iceServers": servers}
 
 
 def spark(vals, lo, hi, color, thresh=None):
@@ -81,7 +84,7 @@ def spark(vals, lo, hi, color, thresh=None):
             f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>')
 
 
-def kpi_html(s, state, ui_fps):
+def kpi_html(s, state):
     pd, ear, mar = s["probs"][1], s["metrics"][0], s["metrics"][1]
     hist = s["history"][-90:]
     name, color, _ = STATES[state]
@@ -96,7 +99,7 @@ def kpi_html(s, state, ui_fps):
   {spark([h[4] for h in hist], 0.0, 1.0, "#b388ff", MAR_YAWN)}</div>
 <div class="kpi"><div class="l">Distraction prob. · 30-frame variance (drowsy)</div>
   <div class="v">{s["probs"][2] * 100:4.1f}% <span style="font-size:.9rem;opacity:.6">σ² {var30:.4f}</span></div></div>
-<div class="perf">cam {s["cap_fps"]:.0f} fps · mesh {s["perc_fps"]:.0f} fps · infer {s["inf_ms"]:.1f} ms · ui {ui_fps:.0f} fps<br>
+<div class="perf">in {s["cap_fps"]:.0f} fps · mesh {s["perc_fps"]:.0f} fps · infer {s["inf_ms"]:.1f} ms<br>
 classifier: {s["label"]}</div>"""
 
 
@@ -117,57 +120,48 @@ def timeline(s):
     return fig
 
 
-# ---- control strip (main container, not sidebar) ----
-top = st.columns([6, 1, 1])
-top[0].markdown("### 🚘 Real-Time Driver Drowsiness & Distraction Monitor")
-cam = int(top[1].number_input("Camera", 0, 9, 0))
-run = top[2].toggle("Live", True)
+# ---- layout (main container, no sidebar) ----
+st.markdown("### 🚘 Real-Time Driver Drowsiness & Distraction Monitor")
+if "pipe" not in st.session_state or st.session_state.pipe.dead:
+    st.session_state.pipe = Pipeline()
+pipe = st.session_state.pipe
+
+
+def on_frame(frame):
+    # runs in the WebRTC thread: hand the frame to the pipeline, return it mirrored + overlaid
+    return av.VideoFrame.from_ndarray(pipe.push(frame.to_ndarray(format="bgr24")), format="bgr24")
+
 
 c1, c2, c3 = st.columns([5, 3, 4])
 c1.markdown("##### Visual stream")
-video = c1.empty()
+with c1:
+    ctx = webrtc_streamer(
+        key="monitor", mode=WebRtcMode.SENDRECV, rtc_configuration=rtc_config(),
+        video_frame_callback=on_frame, async_processing=True,
+        media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480},
+                                            "frameRate": {"ideal": 30}}, "audio": False})
+    st.caption("Press START and allow camera access. Video is processed on the server and not stored.")
 c2.markdown("##### Telemetry")
 kpis = c2.empty()
 c3.markdown("##### Historical timeline")
 chart = c3.empty()
 
-if not run:
-    for p in list(_registry().values()):
-        p.stop()
-    _registry().clear()
-    theme_slot.markdown("<style>:root{--accent:#475569;--anim:none}</style>", unsafe_allow_html=True)
-    st.stop()
-
-pipe = get_pipeline(cam)
-last_seq, last_state, n, ui_rate, t_log, t_send = -1, None, 0, 0.0, time.time(), None
-while True:
-    t0 = time.perf_counter()
-    if pipe.error:
-        st.error(pipe.error)
-        st.stop()
-    if pipe.seq == last_seq:  # cheap check: avoid copying history while nothing is new
-        time.sleep(0.003)
-        continue
+last_state, n, t_log = None, 0, time.time()
+while ctx.state.playing:
     s = pipe.snapshot()
-    if s["frame"] is not None:
-        last_seq = s["seq"]
-        state = int(np.argmax(s["probs"]))
-        if state != last_state:
-            _, color, anim = STATES[state]
-            theme_slot.markdown(f"<style>:root{{--accent:{color};--anim:{anim}}}</style>", unsafe_allow_html=True)
-            last_state = state
-        video.image(s["frame"], width="stretch")  # pre-encoded JPEG bytes
-        if n % 6 == 0:  # ~5 Hz DOM updates
-            kpis.markdown(kpi_html(s, state, ui_rate), unsafe_allow_html=True)
-        if n % 60 == 0:  # ~0.5 Hz: Plotly re-serialisation is the expensive part
-            chart.plotly_chart(timeline(s), width="stretch", config={"displayModeBar": False})
-        n += 1
-        now = time.perf_counter()
-        if t_send:
-            ui_rate = 0.9 * ui_rate + 0.1 / max(now - t_send, 1e-3)
-        t_send = now
+    state = int(np.argmax(s["probs"]))
+    if state != last_state:
+        _, color, anim = STATES[state]
+        theme_slot.markdown(f"<style>:root{{--accent:{color};--anim:{anim}}}</style>", unsafe_allow_html=True)
+        last_state = state
+    kpis.markdown(kpi_html(s, state), unsafe_allow_html=True)
+    if n % 5 == 0:  # ~1 Hz: Plotly re-serialisation is the expensive part
+        chart.plotly_chart(timeline(s), width="stretch", config={"displayModeBar": False})
+    n += 1
     if time.time() - t_log > 5:
-        perf.info("cam=%.1f mesh=%.1f infer=%.1fms ui=%.1f", s["cap_fps"], s["perc_fps"], s["inf_ms"], ui_rate)
+        perf.info("in=%.1f mesh=%.1f infer=%.1fms", s["cap_fps"], s["perc_fps"], s["inf_ms"])
         t_log = time.time()
-    dt = time.perf_counter() - t0
+    time.sleep(0.2)  # 5 Hz telemetry; the video plays client-side and never waits on this loop
 
+pipe.stop()  # camera stopped: free the threads (a fresh Pipeline is created on the next run)
+theme_slot.markdown("<style>:root{--accent:#475569;--anim:none}</style>", unsafe_allow_html=True)

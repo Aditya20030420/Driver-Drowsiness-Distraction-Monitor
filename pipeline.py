@@ -1,7 +1,7 @@
-"""Threaded capture -> MediaPipe ROI extraction -> inference, decoupled from the UI.
+"""Browser-camera frames -> MediaPipe ROI extraction -> inference, decoupled from the UI.
 
-    Grabber thread    : camera.read() as fast as the sensor delivers; keeps only the NEWEST frame (stale frames dropped).
-    Perception thread : face mesh, EAR/MAR/yaw, 64x64 patch mosaic, overlay drawing; feeds the 30-frame deques.
+    WebRTC callback   : Pipeline.push(frame) stores the NEWEST frame and returns it with the latest overlay (cheap).
+    Perception thread : face mesh, EAR/MAR/yaw, 64x64 patch mosaic; feeds the 30-frame deques.
     Inference thread  : ~10 Hz GRU/heuristic classification of the rolling window (never blocks the video path).
     UI (Streamlit)    : only calls Pipeline.snapshot().
 
@@ -20,7 +20,7 @@ import mediapipe as mp
 import numpy as np
 
 log = logging.getLogger("pipeline")
-WEIGHTS = os.path.join(os.path.dirname(__file__), "driver_monitor.pt")
+WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver_monitor.pt")
 SEQ_LEN = 30
 
 # MediaPipe Face Mesh landmark indices
@@ -77,37 +77,17 @@ class Rate:
         self.t = now
 
 
-class Grabber(threading.Thread):
-    def __init__(self, idx):
-        super().__init__(daemon=True)
-        self.idx, self.stop_evt, self.cond = idx, threading.Event(), threading.Condition()
-        self.frame, self.seq, self.error, self.rate = None, 0, None, Rate()
+class FrameSource:
+    """Newest-frame slot fed by the WebRTC callback (browser camera). Stale frames are simply overwritten."""
+    def __init__(self):
+        self.stop_evt, self.cond = threading.Event(), threading.Condition()
+        self.frame, self.seq, self.rate = None, 0, Rate()
 
-    def run(self):
-        backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY) if os.name == "nt" else (cv2.CAP_ANY,)
-        for be in backends:  # DirectShow is fastest but flaky; fall back to Media Foundation
-            cap = cv2.VideoCapture(self.idx, be)
-            if cap.isOpened():
-                break
-        for k, v in ((cv2.CAP_PROP_FRAME_WIDTH, 640), (cv2.CAP_PROP_FRAME_HEIGHT, 480),
-                     (cv2.CAP_PROP_FPS, 30), (cv2.CAP_PROP_BUFFERSIZE, 1)):
-            cap.set(k, v)
-        if not cap.isOpened():
-            self.error = f"Cannot open camera {self.idx}"
-            self.stop_evt.set()
-            with self.cond:
-                self.cond.notify_all()
-            return
-        while not self.stop_evt.is_set():
-            ok, f = cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            with self.cond:
-                self.frame, self.seq = f, self.seq + 1
-                self.cond.notify_all()
-            self.rate.tick()
-        cap.release()
+    def push(self, f):
+        with self.cond:
+            self.frame, self.seq = f, self.seq + 1
+            self.cond.notify_all()
+        self.rate.tick()
 
     def wait_new(self, last, timeout=0.5):
         with self.cond:
@@ -146,28 +126,30 @@ def load_classifier():
 
 
 class Pipeline:
-    def __init__(self, cam_idx=0):
-        self.cam_idx = cam_idx
+    def __init__(self):
         self.lock = threading.Lock()
         self.patches = collections.deque(maxlen=SEQ_LEN)   # uint8 64x64 mosaics (~120 KB total)
         self.feats = collections.deque(maxlen=SEQ_LEN)     # (ear, mar, yaw, face)
         self.history = collections.deque(maxlen=300)       # (t, p_drowsy, p_distracted, ear, mar)
         self.geo = None
-        self.probs, self.frame, self.metrics = np.array([1.0, 0.0, 0.0]), None, (0.0, 0.0, 0.0, False)
-        self.seq, self.inf_ms, self.perc_rate, self.label = 0, 0.0, Rate(), ""
-        self.grab = Grabber(cam_idx)
+        self.probs, self.metrics = np.array([1.0, 0.0, 0.0]), (0.0, 0.0, 0.0, False)
+        self.inf_ms, self.perc_rate, self.label = 0.0, Rate(), ""
+        self.grab = FrameSource()
         self.dead = False
         self._new = threading.Event()
-        self._threads = [self.grab,
-                         threading.Thread(target=self._perceive, daemon=True),
-                         threading.Thread(target=self._render, daemon=True),
-                         threading.Thread(target=self._infer, daemon=True)]
-        for t in self._threads:
-            t.start()
+        for fn in (self._perceive, self._infer):
+            threading.Thread(target=fn, daemon=True).start()
 
-    @property
-    def error(self):
-        return self.grab.error
+    def push(self, frame):
+        """Called from the WebRTC thread with a BGR frame; returns the mirrored frame with the latest overlay."""
+        self.grab.push(frame)
+        out = cv2.flip(frame, 1)  # mirror: natural for the driver
+        geo = self.geo
+        if geo:
+            cv2.polylines(out, geo[0], False, (255, 220, 0), 1, cv2.LINE_AA)
+            for b, c in geo[1]:
+                cv2.rectangle(out, b[:2], b[2:], c, 2)
+        return out
 
     def stop(self):
         self.dead = True
@@ -176,12 +158,14 @@ class Pipeline:
     def _perceive(self):
         mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=False,
                                                min_detection_confidence=0.5, min_tracking_confidence=0.5)
-        last = 0
+        last, t_new = 0, time.time()
         while not self.dead:
             frame, seq = self.grab.wait_new(last)
             if frame is None or seq == last:
+                if time.time() - t_new > 30:  # ponytail: abandoned browser tab -> free the threads; no per-session registry
+                    self.stop()
                 continue
-            last = seq
+            last, t_new = seq, time.time()
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(cv2.flip(cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA), 1), cv2.COLOR_BGR2RGB)  # mirrored; landmarks are normalised so they scale back
             rgb.flags.writeable = False
@@ -214,28 +198,6 @@ class Pipeline:
             self._new.set()
         mesh.close()
 
-    def _render(self, fps=30):
-        """Streams the newest camera frame at a fixed 30 fps cadence with the latest mesh result drawn on it, so the video stays
-        smooth even when the mesh stage (heavy on a 2-core CPU) only manages ~20 Hz."""
-        last, t_prev = 0, time.perf_counter()
-        while not self.dead:
-            frame, seq = self.grab.wait_new(last)
-            if frame is None or seq == last:
-                continue
-            last = seq
-            out = cv2.flip(frame, 1)  # mirror: natural for the driver
-            geo = self.geo
-            if geo:
-                cv2.polylines(out, geo[0], False, (255, 220, 0), 1, cv2.LINE_AA)
-                for b, c in geo[1]:
-                    cv2.rectangle(out, b[:2], b[2:], c, 2)
-            jpeg = cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()  # GIL-free, off the UI thread
-            with self.lock:
-                self.frame, self.seq = jpeg, self.seq + 1
-            t_prev += 1 / fps  # fixed cadence: bursty camera delivery would otherwise show up as stutter
-            time.sleep(max(0.0, t_prev - time.perf_counter()))
-            t_prev = max(t_prev, time.perf_counter() - 0.1)
-
     def _infer(self):
         classify, self.label = load_classifier()
         smooth, interval = None, 0.1
@@ -259,7 +221,7 @@ class Pipeline:
 
     def snapshot(self):
         with self.lock:
-            return dict(frame=self.frame, seq=self.seq, probs=self.probs.copy(), metrics=self.metrics,
+            return dict(probs=self.probs.copy(), metrics=self.metrics,
                         history=list(self.history), inf_ms=self.inf_ms, label=self.label,
                         cap_fps=self.grab.rate.fps, perc_fps=self.perc_rate.fps)
 

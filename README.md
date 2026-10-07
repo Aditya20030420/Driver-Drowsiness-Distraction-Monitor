@@ -8,9 +8,13 @@ shown in a glassmorphism Streamlit dashboard.
 - `app.py` – Streamlit dashboard
 
 ```
-pip install streamlit plotly torch mediapipe opencv-python
-streamlit run app.py
+pip install -r requirements.txt
+streamlit run app.py   # press START in the page; the browser webcam is streamed via WebRTC
 ```
 
 Without `driver_monitor.pt` the app uses a rule-based fallback (PERCLOS / yawn / head-turn); train `DriverMonitorNet`
 and save its `state_dict` as `driver_monitor.pt` to switch to the neural model.
+
+## Deploy
+- **Streamlit Community Cloud** (easiest; STUN is enough): point it at `app.py`; `packages.txt` installs the system libs.
+- **Docker** (Hugging Face Spaces / Render): `Dockerfile` included. These hosts usually block UDP, so set `TURN_URL`, `TURN_USER`, `TURN_PASS` (e.g. a free metered.ca Open Relay account).
