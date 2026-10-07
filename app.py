@@ -58,13 +58,13 @@ theme_slot = st.empty()  # re-rendered only when the safety state changes
 
 
 def rtc_config():
-    """Google STUN by default; add a TURN relay via env/secrets (TURN_URL, TURN_USER, TURN_PASS) when the host blocks
+    """Google STUN by default; add a TURN relay via env/secrets (TURN_URL as a comma-separated list, TURN_USER, TURN_PASS) when the host blocks
     UDP (Hugging Face Spaces, Render)."""
     servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
     try:
         get = lambda k: os.environ.get(k) or st.secrets.get(k, "")
         if get("TURN_URL"):
-            servers.append({"urls": [get("TURN_URL")], "username": get("TURN_USER"), "credential": get("TURN_PASS")})
+            servers.append({"urls": [u.strip() for u in get("TURN_URL").split(",")], "username": get("TURN_USER"), "credential": get("TURN_PASS")})
     except Exception:  # no secrets file when running locally
         pass
     return {"iceServers": servers}
